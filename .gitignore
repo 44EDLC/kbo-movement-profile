@@ -1,0 +1,5 @@
+trackman_history.csv
+reports/
+profiles/
+__pycache__/
+*.pyc

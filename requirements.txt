@@ -1,0 +1,6 @@
+gradio==6.28.0
+pandas
+numpy
+matplotlib
+pyarrow
+koreanize-matplotlib
