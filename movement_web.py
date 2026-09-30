@@ -2,19 +2,22 @@ import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+from matplotlib.patches import Circle
+import gradio as gr
+
 try:
     import koreanize_matplotlib
 except Exception:
     koreanize_matplotlib = None
-from matplotlib.gridspec import GridSpec
-from matplotlib.patches import Circle
-import gradio as gr
+
 
 # =========================================================
 # 기본 설정
 # =========================================================
 
-DATA_FILE = "trackman_web.parquet"
+PLAYER_DATA_DIR = "player_data"
+PLAYER_LOOKUP_FILE = "player_lookup.csv"
 PARK_EFFECT_FILE = "park_effects_slot_v2_by_season.csv"
 
 plt.rcParams["font.family"] = ["Malgun Gothic", "NanumGothic"]
@@ -22,20 +25,13 @@ plt.rcParams["axes.unicode_minus"] = False
 
 
 # =========================================================
-# 선수 ID
+# 선수 Lookup
 # =========================================================
-
-# =========================================================
-# 선수 이름 ↔ TrackMan ID 자동 Lookup
-# =========================================================
-
-PLAYER_LOOKUP_FILE = "player_lookup.csv"
 
 player_lookup = pd.read_csv(
     PLAYER_LOOKUP_FILE
 )
 
-# 이름 없는 10명 제외
 player_lookup["player_name"] = (
     player_lookup["player_name"]
     .fillna("")
@@ -52,8 +48,6 @@ player_lookup["pitcher_trackman_id"] = (
     .astype(int)
 )
 
-# 같은 이름 선수가 있을 경우
-# 우선 투구수가 많은 선수를 기본값으로 설정
 PLAYER_IDS = (
     player_lookup
     .sort_values(
@@ -73,6 +67,45 @@ print(
     f"선수 Lookup 로드 완료: "
     f"{len(player_lookup):,}명"
 )
+
+
+# =========================================================
+# 구장 보정치
+# =========================================================
+
+effects = pd.read_csv(
+    PARK_EFFECT_FILE
+)
+
+effects = effects[
+    [
+        "season",
+        "park",
+        "IVB_effect",
+        "HB_effect"
+    ]
+].copy()
+
+
+# =========================================================
+# 데이터 열
+# =========================================================
+
+cols = [
+    "season",
+    "top_bottom",
+    "pitcher_trackman_id",
+    "pitcher_team",
+    "batter_team",
+    "pitcher_hand",
+    "batter_hand",
+    "tagged_pitch_type",
+    "rel_speed",
+    "spin_rate",
+    "induced_vert_break",
+    "horz_break",
+]
+
 
 # =========================================================
 # 구장
@@ -120,18 +153,22 @@ HAND_MAP = {
 
 
 # =========================================================
-# 구종
+# 구종명
 # =========================================================
 
 PITCH_NAME_MAP = {
     "Fastball": "4-Seam",
+
     "Sinker": "Sinker",
     "SInker": "Sinker",
+
     "Cutter": "Cutter",
     "Slider": "Slider",
     "Curveball": "Curveball",
+
     "ChangeUp": "Changeup",
     "Changeup": "Changeup",
+
     "Splitter": "Splitter",
     "Sweeper": "Sweeper",
     "Slurve": "Slurve",
@@ -139,7 +176,7 @@ PITCH_NAME_MAP = {
 
 
 # =========================================================
-# 구종 색
+# 구종 색상
 # =========================================================
 
 PITCH_COLORS = {
@@ -153,91 +190,6 @@ PITCH_COLORS = {
     "Sweeper": "#24b869",
     "Slurve": "#6e87d8",
 }
-
-
-# =========================================================
-# 데이터 불러오기
-# =========================================================
-
-print("TrackMan 데이터 불러오는 중...")
-
-cols = [
-    "season",
-    "top_bottom",
-    "pitcher_trackman_id",
-    "pitcher_team",
-    "batter_team",
-    "pitcher_hand",
-    "batter_hand",
-    "tagged_pitch_type",
-    "rel_speed",
-    "spin_rate",
-    "induced_vert_break",
-    "horz_break",
-]
-
-df = pd.read_parquet(
-    DATA_FILE,
-    columns=cols
-)
-effects = pd.read_csv(PARK_EFFECT_FILE)
-
-print(f"전체 투구 수: {len(df):,}")
-
-
-# =========================================================
-# 구장 판별
-# =========================================================
-
-df["home_team"] = np.where(
-    df["top_bottom"] == "Top",
-    df["pitcher_team"],
-    df["batter_team"]
-)
-
-df["park"] = df["home_team"].map(PARK_MAP)
-
-
-# =========================================================
-# Movement cm -> inch
-# =========================================================
-
-df["IVB_raw"] = (
-    pd.to_numeric(
-        df["induced_vert_break"],
-        errors="coerce"
-    ) / 2.54
-)
-
-df["HB_raw"] = (
-    pd.to_numeric(
-        df["horz_break"],
-        errors="coerce"
-    ) / 2.54
-)
-
-
-# =========================================================
-# 구장 보정
-# =========================================================
-
-effects = effects[
-    [
-        "season",
-        "park",
-        "IVB_effect",
-        "HB_effect"
-    ]
-].copy()
-
-df = df.merge(
-    effects,
-    on=["season", "park"],
-    how="left"
-)
-
-df["IVB"] = df["IVB_raw"] - df["IVB_effect"]
-df["HB"] = df["HB_raw"] - df["HB_effect"]
 
 
 # =========================================================
@@ -260,33 +212,149 @@ def normalize_batter_hand(x):
     return np.nan
 
 
-df["batter_side"] = (
-    df["batter_hand"]
-    .apply(normalize_batter_hand)
-)
+# =========================================================
+# ★ 선수 한 명 데이터만 불러오기
+# =========================================================
+
+def load_player_data(player_id):
+
+    file_path = os.path.join(
+        PLAYER_DATA_DIR,
+        f"{player_id}.parquet"
+    )
+
+    if not os.path.exists(file_path):
+        return None
+
+    player_df = pd.read_parquet(
+        file_path,
+        columns=cols
+    )
+
+    # -----------------------------------------------------
+    # 홈팀 / 구장
+    # -----------------------------------------------------
+
+    player_df["home_team"] = np.where(
+        player_df["top_bottom"] == "Top",
+        player_df["pitcher_team"],
+        player_df["batter_team"]
+    )
+
+    player_df["park"] = (
+        player_df["home_team"]
+        .map(PARK_MAP)
+    )
+
+
+    # -----------------------------------------------------
+    # Movement cm → inch
+    # -----------------------------------------------------
+
+    player_df["IVB_raw"] = (
+        pd.to_numeric(
+            player_df["induced_vert_break"],
+            errors="coerce"
+        )
+        / 2.54
+    )
+
+    player_df["HB_raw"] = (
+        pd.to_numeric(
+            player_df["horz_break"],
+            errors="coerce"
+        )
+        / 2.54
+    )
+
+
+    # -----------------------------------------------------
+    # 시즌별 구장 보정
+    # -----------------------------------------------------
+
+    player_df = player_df.merge(
+        effects,
+        on=["season", "park"],
+        how="left"
+    )
+
+    player_df["IVB"] = (
+        player_df["IVB_raw"]
+        - player_df["IVB_effect"]
+    )
+
+    player_df["HB"] = (
+        player_df["HB_raw"]
+        - player_df["HB_effect"]
+    )
+
+
+    # -----------------------------------------------------
+    # 타자 손잡이
+    # -----------------------------------------------------
+
+    player_df["batter_side"] = (
+        player_df["batter_hand"]
+        .apply(normalize_batter_hand)
+    )
+
+    return player_df
 
 
 # =========================================================
-# 리포트 생성 함수
+# Movement Report
 # =========================================================
 
-def movement_report(player_name, season):
+def movement_report(
+    player_name,
+    season
+):
 
     if player_name not in PLAYER_IDS:
-        print(f"{player_name}의 TrackMan ID가 없습니다.")
-        return
 
-    player_id = PLAYER_IDS[player_name]
+        print(
+            f"{player_name}의 TrackMan ID가 없습니다."
+        )
 
-    p = df[
-        (df["pitcher_trackman_id"] == player_id)
-        &
-        (df["season"] == season)
+        return None
+
+
+    player_id = (
+        PLAYER_IDS[player_name]
+    )
+
+
+    # =====================================================
+    # 이 선수 데이터만 RAM으로 불러오기
+    # =====================================================
+
+    player_df = load_player_data(
+        player_id
+    )
+
+
+    if player_df is None:
+
+        print(
+            "선수 데이터 파일이 없습니다."
+        )
+
+        return None
+
+
+    p = player_df[
+        player_df["season"]
+        == season
     ].copy()
 
+
     if len(p) == 0:
-        print("해당 시즌 데이터가 없습니다.")
-        return
+
+        print(
+            "해당 시즌 데이터가 없습니다."
+        )
+
+        return None
 
 
     # =====================================================
@@ -298,9 +366,11 @@ def movement_report(player_name, season):
         .map(PITCH_NAME_MAP)
     )
 
+
     p = p[
         p["pitch_name"].notna()
     ].copy()
+
 
     p = p[
         p["park"].notna()
@@ -311,7 +381,7 @@ def movement_report(player_name, season):
 
 
     # =====================================================
-    # 10구 이상
+    # 최소 10구 구종
     # =====================================================
 
     counts = (
@@ -319,21 +389,34 @@ def movement_report(player_name, season):
         .size()
     )
 
+
     valid_pitch_types = (
-        counts[counts >= 10]
-        .index
+        counts[
+            counts >= 10
+        ].index
     )
+
 
     p = p[
         p["pitch_name"]
         .isin(valid_pitch_types)
     ].copy()
 
+
     total_pitches = len(p)
 
 
+    if total_pitches == 0:
+
+        print(
+            "10구 이상인 구종 데이터가 없습니다."
+        )
+
+        return None
+
+
     # =====================================================
-    # Movement 이상치 제거
+    # Movement 이상치
     # =====================================================
 
     clean = p[
@@ -351,19 +434,40 @@ def movement_report(player_name, season):
         clean
         .groupby("pitch_name")
         .agg(
-            Count=("pitch_name", "size"),
-            Velocity=("rel_speed", "mean"),
-            IVB=("IVB", "mean"),
-            HB=("HB", "mean"),
-            Spin=("spin_rate", "mean"),
+            Count=(
+                "pitch_name",
+                "size"
+            ),
+
+            Velocity=(
+                "rel_speed",
+                "mean"
+            ),
+
+            IVB=(
+                "IVB",
+                "mean"
+            ),
+
+            HB=(
+                "HB",
+                "mean"
+            ),
+
+            Spin=(
+                "spin_rate",
+                "mean"
+            )
         )
     )
+
 
     arsenal["Pitch%"] = (
         arsenal["Count"]
         / total_pitches
         * 100
     )
+
 
     arsenal = arsenal[
         [
@@ -376,12 +480,18 @@ def movement_report(player_name, season):
         ]
     ]
 
-    arsenal = arsenal.sort_values(
-        "Pitch%",
-        ascending=False
+
+    arsenal = (
+        arsenal.sort_values(
+            "Pitch%",
+            ascending=False
+        )
     )
 
-    pitch_order = arsenal.index.tolist()
+
+    pitch_order = (
+        arsenal.index.tolist()
+    )
 
 
     # =====================================================
@@ -394,20 +504,28 @@ def movement_report(player_name, season):
         .mode()
     )
 
-    raw_team = (
-        team_mode.iloc[0]
-        if len(team_mode) > 0
-        else ""
-    )
 
-    team_name = TEAM_NAME_MAP.get(
-        raw_team,
-        raw_team
+    if len(team_mode) > 0:
+
+        raw_team = (
+            team_mode.iloc[0]
+        )
+
+    else:
+
+        raw_team = ""
+
+
+    team_name = (
+        TEAM_NAME_MAP.get(
+            raw_team,
+            raw_team
+        )
     )
 
 
     # =====================================================
-    # 손잡이
+    # 투수 손
     # =====================================================
 
     hand_mode = (
@@ -416,15 +534,23 @@ def movement_report(player_name, season):
         .mode()
     )
 
-    raw_hand = (
-        hand_mode.iloc[0]
-        if len(hand_mode) > 0
-        else ""
-    )
 
-    hand_name = HAND_MAP.get(
-        raw_hand,
-        raw_hand
+    if len(hand_mode) > 0:
+
+        raw_hand = (
+            hand_mode.iloc[0]
+        )
+
+    else:
+
+        raw_hand = ""
+
+
+    hand_name = (
+        HAND_MAP.get(
+            raw_hand,
+            raw_hand
+        )
     )
 
 
@@ -434,40 +560,58 @@ def movement_report(player_name, season):
 
     usage = (
         p.groupby(
-            ["pitch_name", "batter_side"]
+            [
+                "pitch_name",
+                "batter_side"
+            ]
         )
         .size()
-        .unstack(fill_value=0)
+        .unstack(
+            fill_value=0
+        )
     )
+
 
     if "LHH" not in usage.columns:
         usage["LHH"] = 0
+
 
     if "RHH" not in usage.columns:
         usage["RHH"] = 0
 
 
-    total_lhh = usage["LHH"].sum()
-    total_rhh = usage["RHH"].sum()
+    total_lhh = (
+        usage["LHH"].sum()
+    )
+
+    total_rhh = (
+        usage["RHH"].sum()
+    )
 
 
     if total_lhh > 0:
+
         usage["LHH_pct"] = (
             usage["LHH"]
             / total_lhh
             * 100
         )
+
     else:
+
         usage["LHH_pct"] = 0
 
 
     if total_rhh > 0:
+
         usage["RHH_pct"] = (
             usage["RHH"]
             / total_rhh
             * 100
         )
+
     else:
+
         usage["RHH_pct"] = 0
 
 
@@ -480,17 +624,28 @@ def movement_report(player_name, season):
     # Summary
     # =====================================================
 
-    avg_velo = p["rel_speed"].mean()
-    avg_spin = p["spin_rate"].mean()
-
-    lhh_count = int(
-        (p["batter_side"] == "LHH")
-        .sum()
+    avg_velo = (
+        p["rel_speed"].mean()
     )
 
+    avg_spin = (
+        p["spin_rate"].mean()
+    )
+
+
+    lhh_count = int(
+        (
+            p["batter_side"]
+            == "LHH"
+        ).sum()
+    )
+
+
     rhh_count = int(
-        (p["batter_side"] == "RHH")
-        .sum()
+        (
+            p["batter_side"]
+            == "RHH"
+        ).sum()
     )
 
 
@@ -622,42 +777,79 @@ def movement_report(player_name, season):
     ]
 
 
-    summary_table = ax_summary.table(
-        cellText=[
-            summary_headers,
-            summary_values
-        ],
+    summary_table = (
+        ax_summary.table(
+            cellText=[
+                summary_headers,
+                summary_values
+            ],
 
-        cellLoc="center",
+            cellLoc="center",
 
-        bbox=[
-            0.025,
-            0.04,
-            0.95,
-            0.92
-        ]
+            bbox=[
+                0.025,
+                0.04,
+                0.95,
+                0.92
+            ]
+        )
     )
 
 
-    summary_table.auto_set_font_size(False)
+    summary_table.auto_set_font_size(
+        False
+    )
 
 
-    for col in range(len(summary_headers)):
+    for col in range(
+        len(summary_headers)
+    ):
 
-        head = summary_table[(0, col)]
-        value = summary_table[(1, col)]
+        head = (
+            summary_table[
+                (0, col)
+            ]
+        )
+
+        value = (
+            summary_table[
+                (1, col)
+            ]
+        )
 
 
-        head.set_facecolor("#17396d")
-        head.get_text().set_color("white")
-        head.get_text().set_fontweight("bold")
-        head.get_text().set_fontsize(13.5)
+        head.set_facecolor(
+            "#17396d"
+        )
+
+        head.get_text().set_color(
+            "white"
+        )
+
+        head.get_text().set_fontweight(
+            "bold"
+        )
+
+        head.get_text().set_fontsize(
+            13.5
+        )
 
 
-        value.set_facecolor("#ffffff")
-        value.get_text().set_color("#111827")
-        value.get_text().set_fontweight("bold")
-        value.get_text().set_fontsize(15)
+        value.set_facecolor(
+            "#ffffff"
+        )
+
+        value.get_text().set_color(
+            "#111827"
+        )
+
+        value.get_text().set_fontweight(
+            "bold"
+        )
+
+        value.get_text().set_fontsize(
+            15
+        )
 
 
         head.set_linewidth(1.1)
@@ -665,7 +857,7 @@ def movement_report(player_name, season):
 
 
     # =====================================================
-    # 그래프 영역
+    # 그래프
     # =====================================================
 
     ax_velo = fig.add_subplot(
@@ -709,6 +901,7 @@ def movement_report(player_name, season):
         )
     )
 
+
     velo_max = min(
         165,
         np.ceil(
@@ -725,16 +918,19 @@ def movement_report(player_name, season):
 
         vals = (
             p.loc[
-                p["pitch_name"] == pitch,
+                p["pitch_name"]
+                == pitch,
                 "rel_speed"
             ]
             .dropna()
         )
 
 
-        color = PITCH_COLORS.get(
-            pitch,
-            "#777777"
+        color = (
+            PITCH_COLORS.get(
+                pitch,
+                "#777777"
+            )
         )
 
 
@@ -745,21 +941,31 @@ def movement_report(player_name, season):
         )
 
 
-        hist, edges = np.histogram(
-            vals,
-            bins=bins,
-            density=True
+        hist, edges = (
+            np.histogram(
+                vals,
+                bins=bins,
+                density=True
+            )
         )
 
 
         if len(hist) >= 5:
 
             kernel = np.array(
-                [1, 2, 3, 2, 1],
+                [
+                    1,
+                    2,
+                    3,
+                    2,
+                    1
+                ],
                 dtype=float
             )
 
-            kernel /= kernel.sum()
+            kernel /= (
+                kernel.sum()
+            )
 
             hist = np.convolve(
                 hist,
@@ -809,6 +1015,7 @@ def movement_report(player_name, season):
             y + 0.95,
 
             color=color,
+
             linestyle="--",
             linewidth=1.3
         )
@@ -819,10 +1026,12 @@ def movement_report(player_name, season):
         velo_max
     )
 
+
     ax_velo.set_ylim(
         -0.45,
         max(velocity_y) + 1.35
     )
+
 
     ax_velo.set_yticks([])
 
@@ -886,6 +1095,7 @@ def movement_report(player_name, season):
         0,
 
         color="#d78968",
+
         linestyle="--",
         linewidth=1,
 
@@ -897,6 +1107,7 @@ def movement_report(player_name, season):
         0,
 
         color="#d78968",
+
         linestyle="--",
         linewidth=1,
 
@@ -907,13 +1118,16 @@ def movement_report(player_name, season):
     for pitch in pitch_order:
 
         pitch_data = clean[
-            clean["pitch_name"] == pitch
+            clean["pitch_name"]
+            == pitch
         ]
 
 
-        color = PITCH_COLORS.get(
-            pitch,
-            "#777777"
+        color = (
+            PITCH_COLORS.get(
+                pitch,
+                "#777777"
+            )
         )
 
 
@@ -932,8 +1146,15 @@ def movement_report(player_name, season):
         )
 
 
-    ax_break.set_xlim(-30, 30)
-    ax_break.set_ylim(-30, 30)
+    ax_break.set_xlim(
+        -30,
+        30
+    )
+
+    ax_break.set_ylim(
+        -30,
+        30
+    )
 
 
     ax_break.set_aspect(
@@ -947,6 +1168,7 @@ def movement_report(player_name, season):
         fontsize=13,
         fontweight="medium"
     )
+
 
     ax_break.set_ylabel(
         "Induced Vertical Break (in)",
@@ -986,16 +1208,22 @@ def movement_report(player_name, season):
     )
 
 
-    lhh = usage.loc[
-        pitch_order,
-        "LHH_pct"
-    ].values
+    lhh = (
+        usage.loc[
+            pitch_order,
+            "LHH_pct"
+        ]
+        .values
+    )
 
 
-    rhh = usage.loc[
-        pitch_order,
-        "RHH_pct"
-    ].values
+    rhh = (
+        usage.loc[
+            pitch_order,
+            "RHH_pct"
+        ]
+        .values
+    )
 
 
     usage_colors = [
@@ -1003,6 +1231,7 @@ def movement_report(player_name, season):
             pitch,
             "#777777"
         )
+
         for pitch in pitch_order
     ]
 
@@ -1079,6 +1308,7 @@ def movement_report(player_name, season):
 
     max_usage = max(
         55,
+
         np.ceil(
             max(
                 lhh.max(),
@@ -1178,11 +1408,17 @@ def movement_report(player_name, season):
 
         table_data.append([
             pitch,
+
             f"{int(row['Count']):,}",
+
             f"{row['Pitch%']:.1f}%",
+
             f"{row['Velocity']:.1f}",
+
             f"{row['IVB']:.1f}",
+
             f"{row['HB']:.1f}",
+
             f"{row['Spin']:.0f}"
         ])
 
@@ -1211,41 +1447,59 @@ def movement_report(player_name, season):
     )
 
 
-    table.auto_set_font_size(False)
+    table.auto_set_font_size(
+        False
+    )
 
 
     # =====================================================
-    # ARSENAL TABLE FONT = ARIAL
+    # TABLE HEADER - ARIAL
     # =====================================================
 
-    for col in range(len(columns)):
+    for col in range(
+        len(columns)
+    ):
 
-        cell = table[(0, col)]
+        cell = (
+            table[
+                (0, col)
+            ]
+        )
+
 
         cell.set_facecolor(
             "#17396d"
         )
 
+
         cell.get_text().set_color(
             "white"
         )
+
 
         cell.get_text().set_fontfamily(
             "Arial"
         )
 
+
         cell.get_text().set_fontweight(
             "bold"
         )
+
 
         cell.get_text().set_fontsize(
             13
         )
 
+
         cell.set_linewidth(
             1.15
         )
 
+
+    # =====================================================
+    # TABLE DATA - ARIAL
+    # =====================================================
 
     for row_i in range(
         1,
@@ -1256,22 +1510,27 @@ def movement_report(player_name, season):
             len(columns)
         ):
 
-            cell = table[
-                (row_i, col_i)
-            ]
+            cell = (
+                table[
+                    (row_i, col_i)
+                ]
+            )
 
 
             cell.get_text().set_fontfamily(
                 "Arial"
             )
 
+
             cell.get_text().set_fontsize(
                 12.5
             )
 
+
             cell.get_text().set_fontweight(
                 "semibold"
             )
+
 
             cell.set_linewidth(
                 1.0
@@ -1306,6 +1565,7 @@ def movement_report(player_name, season):
                         "#111111"
                     )
 
+
                 else:
 
                     cell.get_text().set_color(
@@ -1318,6 +1578,7 @@ def movement_report(player_name, season):
                 cell.set_facecolor(
                     "#f5f6f8"
                 )
+
 
                 cell.get_text().set_color(
                     "#161b22"
@@ -1351,7 +1612,7 @@ def movement_report(player_name, season):
 
     filename = (
         f"reports/"
-        f"{player_name}_{season}_movement_report_v6.png"
+        f"{player_name}_{season}_movement_report.png"
     )
 
 
@@ -1364,31 +1625,27 @@ def movement_report(player_name, season):
     )
 
 
-    print()
-    print("=" * 70)
-
-    print(
-        f"{player_name} {season} 리포트 생성 완료"
-    )
-
-    print(
-        f"저장 위치: {filename}"
-    )
-
-    print("=" * 70)
-
-
+    # 웹 서버에서는 창을 띄우지 않음
     plt.close(fig)
+
+
+    # 선수 데이터도 더 이상 필요 없음
+    del player_df
+    del p
+    del clean
+
+
+    print(
+        f"{player_name} {season} "
+        f"프로필 생성 완료"
+    )
+
+
     return filename
 
 
-
 # =========================================================
-# 여기만 바꿔서 사용
-# =========================================================
-
-# =========================================================
-# KBO MOVEMENT PROFILE WEB APP
+# 웹사이트용 선수 목록
 # =========================================================
 
 PLAYER_NAMES = sorted(
@@ -1396,33 +1653,43 @@ PLAYER_NAMES = sorted(
     .dropna()
     .astype(str)
     .str.strip()
-    .loc[lambda x: x != ""]
+    .loc[
+        lambda x: x != ""
+    ]
     .unique()
     .tolist()
 )
 
 
 # =========================================================
-# 선수 선택 → 시즌 목록
+# 선수 선택 → 시즌
 # =========================================================
 
-def update_seasons(player_name):
+def update_seasons(
+    player_name
+):
 
     if not player_name:
+
         return gr.Dropdown(
             choices=[],
             value=None
         )
+
 
     matches = player_lookup[
-        player_lookup["player_name"] == player_name
+        player_lookup["player_name"]
+        == player_name
     ].copy()
 
+
     if len(matches) == 0:
+
         return gr.Dropdown(
             choices=[],
             value=None
         )
+
 
     selected = (
         matches
@@ -1433,26 +1700,56 @@ def update_seasons(player_name):
         .iloc[0]
     )
 
+
     player_id = int(
-        selected["pitcher_trackman_id"]
+        selected[
+            "pitcher_trackman_id"
+        ]
     )
 
+
+    file_path = os.path.join(
+        PLAYER_DATA_DIR,
+        f"{player_id}.parquet"
+    )
+
+
+    if not os.path.exists(
+        file_path
+    ):
+
+        return gr.Dropdown(
+            choices=[],
+            value=None
+        )
+
+
+    # 시즌 열 하나만 읽음
+    season_df = pd.read_parquet(
+        file_path,
+        columns=["season"]
+    )
+
+
     seasons = sorted(
-        df.loc[
-            df["pitcher_trackman_id"] == player_id,
-            "season"
-        ]
+        season_df["season"]
         .dropna()
         .astype(int)
         .unique()
         .tolist()
     )
 
+
+    del season_df
+
+
     if len(seasons) == 0:
+
         return gr.Dropdown(
             choices=[],
             value=None
         )
+
 
     return gr.Dropdown(
         choices=seasons,
@@ -1461,29 +1758,40 @@ def update_seasons(player_name):
 
 
 # =========================================================
-# 프로필 생성
+# 웹 프로필 생성
 # =========================================================
 
-def generate_profile_web(player_name, season):
+def generate_profile_web(
+    player_name,
+    season
+):
 
     if not player_name:
+
         raise gr.Error(
             "투수를 선택해주세요."
         )
 
+
     if season is None:
+
         raise gr.Error(
             "시즌을 선택해주세요."
         )
 
+
     matches = player_lookup[
-        player_lookup["player_name"] == player_name
+        player_lookup["player_name"]
+        == player_name
     ].copy()
 
+
     if len(matches) == 0:
+
         raise gr.Error(
             "선수를 찾을 수 없습니다."
         )
+
 
     selected = (
         matches
@@ -1494,30 +1802,42 @@ def generate_profile_web(player_name, season):
         .iloc[0]
     )
 
+
     player_id = int(
-        selected["pitcher_trackman_id"]
+        selected[
+            "pitcher_trackman_id"
+        ]
     )
 
-    # 기존 프로필 엔진에 선택 선수 ID 전달
-    PLAYER_IDS[player_name] = player_id
 
-    season = int(season)
+    PLAYER_IDS[player_name] = (
+        player_id
+    )
+
+
+    season = int(
+        season
+    )
+
 
     filename = movement_report(
         player_name,
         season
     )
 
+
     if filename is None:
+
         raise gr.Error(
             "프로필 생성에 실패했습니다."
         )
+
 
     return filename
 
 
 # =========================================================
-# 웹사이트 화면
+# GRADIO UI
 # =========================================================
 
 with gr.Blocks(
@@ -1534,6 +1854,7 @@ KBO TrackMan 데이터를 이용한 투수 Movement Profile입니다.
         """
     )
 
+
     with gr.Row():
 
         player_input = gr.Dropdown(
@@ -1543,6 +1864,7 @@ KBO TrackMan 데이터를 이용한 투수 Movement Profile입니다.
             filterable=True,
             interactive=True
         )
+
 
         season_input = gr.Dropdown(
             choices=[],
@@ -1564,7 +1886,6 @@ KBO TrackMan 데이터를 이용한 투수 Movement Profile입니다.
     )
 
 
-    # 투수를 바꾸면 시즌 목록도 자동 변경
     player_input.change(
         fn=update_seasons,
         inputs=player_input,
@@ -1572,7 +1893,6 @@ KBO TrackMan 데이터를 이용한 투수 Movement Profile입니다.
     )
 
 
-    # 프로필 생성 버튼
     generate_button.click(
         fn=generate_profile_web,
         inputs=[
@@ -1584,7 +1904,7 @@ KBO TrackMan 데이터를 이용한 투수 Movement Profile입니다.
 
 
 # =========================================================
-# 웹 서버 실행
+# 서버
 # =========================================================
 
 if __name__ == "__main__":
@@ -1595,6 +1915,7 @@ if __name__ == "__main__":
             7860
         )
     )
+
 
     demo.launch(
         server_name="0.0.0.0",
